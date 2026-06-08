@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
-INPUT_VIDEO   = "/content/drive/MyDrive/kik/bbb10_lossless.mov"
+INPUT_VIDEO   = "/content/bbb10_lossless.mov"
 RESOLUTIONS   = ["176x144", "352x288", "720x480", "1280x720", "1920x1080"]
 BITRATES_KBPS = [100, 500, 1000, 2500, 5000, 7500, 10000, 15000]
 
@@ -89,12 +89,18 @@ def encode_task(args: tuple):
     tmp = f"tmp_{res}_{codec_name}_{br}k_{threading.get_ident()}.mkv"
     actual_codec = GPU_MAP.get(ffmpeg_codec, ffmpeg_codec) if use_gpu else ffmpeg_codec
 
-    cmd = ["ffmpeg", "-hide_banner", "-y",
-           "-i", ref_video,
-           "-c:v", actual_codec, "-b:v", f"{br}k"]
-    if not use_gpu:
-        cmd += SPEED_FLAGS.get(ffmpeg_codec, [])
-    cmd += ["-an", tmp]
+    # Modify your command generation inside encode_task if use_gpu is True:
+    if use_gpu and ("nvenc" in actual_codec):
+        cmd = ["ffmpeg", "-hide_banner", "-y", 
+              "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", # Hardware decode
+              "-i", ref_video, 
+              "-c:v", actual_codec, "-b:v", f"{br}k", "-an", tmp]
+    else:
+      cmd = ["ffmpeg", "-hide_banner", "-y",
+            "-i", ref_video,
+            "-c:v", actual_codec, "-b:v", f"{br}k"]
+      cmd += SPEED_FLAGS.get(ffmpeg_codec, [])
+      cmd += ["-an", tmp]
 
     t0 = time.time()
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
