@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
-INPUT_VIDEO   = "/content/bbb10_lossless.mov"
+INPUT_VIDEO   = "bbb10_lossless.mov"
 RESOLUTIONS   = ["176x144", "352x288", "720x480", "1280x720", "1920x1080"]
 BITRATES_KBPS = [100, 500, 1000, 2500, 5000, 7500, 10000, 15000]
 
@@ -18,7 +18,7 @@ CLIP_DURATION = 10    # seconds
 
 # ★ SPEEDUP #2 — run this many encode jobs at the same time.
 #   Colab standard tier has 2 vCPUs; 4 workers keeps both busy while one waits on I/O.
-MAX_WORKERS   = 4
+MAX_WORKERS   = 8
 
 CODECS = {
     "H.261":  "h261",
@@ -34,10 +34,16 @@ SPEED_FLAGS = {
     "libx265": ["-preset", "ultrafast", "-x265-params", "log-level=error"],
 }
 
-# ★ SPEEDUP #4 — hardware encoding when an NVIDIA GPU is present (automatic).
-GPU_MAP = {
+# CUDA
+NVENC_MAP = {
     "libx264": "h264_nvenc",
     "libx265": "hevc_nvenc",
+}
+
+# AMD polaris
+AMF_MAP = {
+    "libx264": "h264_amf",
+    "libx265": "hevc_amf",
 }
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -78,37 +84,89 @@ def make_reference(src: str, resolution: str, duration: int) -> str:
     )
     return out
 
+def detect_gpu_hardware() -> str:
+    """
+    Detects if NVENC (NVIDIA) or AMF (AMD) encoders are physically available and working.
+    Returns: 'nvenc', 'amf', or None
+    """
+    try:
+        # First check if the encoders are compiled in
+        enc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=5,
+        )
+        
+        # Test AMF (AMD) by running a tiny test command if 'h264_amf' is compiled
+        if "h264_amf" in enc.stdout:
+            # Quick dry-run to see if AMF initializes on your RX 570
+            test_amf = subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "color=size=256x256:duration=0.1:rate=25", "-c:v", "h264_amf", "-f", "null", "-"],
+                capture_output=True
+            )
+            if test_amf.returncode == 0:
+                return "amf"
+                
+        # Test NVENC (NVIDIA)
+        if "h264_nvenc" in enc.stdout:
+            test_nvenc = subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "color=size=256x256:duration=0.1:rate=25", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True
+            )
+            if test_nvenc.returncode == 0:
+                return "nvenc"
+                
+        return None
+    except Exception:
+        return None
 
 # ─── CORE ENCODE TASK (runs inside thread pool) ───────────────────────────────
 
 def encode_task(args: tuple):
     """Single (codec × bitrate) encode + PSNR measurement. Thread-safe."""
-    ref_video, ref_size, codec_name, ffmpeg_codec, br, res, use_gpu = args
+    ref_video, ref_size, codec_name, ffmpeg_codec, br, res, use_gpu, current_gpu_map = args
 
     # Unique temp filename per thread to avoid collisions
     tmp = f"tmp_{res}_{codec_name}_{br}k_{threading.get_ident()}.mkv"
-    actual_codec = GPU_MAP.get(ffmpeg_codec, ffmpeg_codec) if use_gpu else ffmpeg_codec
+    actual_codec = current_gpu_map.get(ffmpeg_codec, ffmpeg_codec) if use_gpu else ffmpeg_codec
 
-    # Modify your command generation inside encode_task if use_gpu is True:
-    if use_gpu and ("nvenc" in actual_codec):
-        cmd = ["ffmpeg", "-hide_banner", "-y", 
-              "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", # Hardware decode
-              "-i", ref_video, 
-              "-c:v", actual_codec, "-b:v", f"{br}k", "-an", tmp]
+    # Base command structure
+    cmd = ["ffmpeg", "-hide_banner", "-y"]
+
+    if use_gpu and ("amf" in actual_codec):
+        # Clean execution for AMD AMF hardware encoder
+        cmd += ["-i", ref_video, "-c:v", actual_codec, "-b:v", f"{br}k", "-an", tmp]
+        
+    elif use_gpu and ("nvenc" in actual_codec):
+        # Clean execution for NVIDIA hardware encoder
+        cmd += ["-hwaccel", "cuda", "-i", ref_video, "-c:v", actual_codec, "-b:v", f"{br}k", "-an", tmp]
+        
     else:
-      cmd = ["ffmpeg", "-hide_banner", "-y",
-            "-i", ref_video,
-            "-c:v", actual_codec, "-b:v", f"{br}k"]
-      cmd += SPEED_FLAGS.get(ffmpeg_codec, [])
-      cmd += ["-an", tmp]
+        # Software encoders (CPU fallback, MPEG-4, etc.)
+        cmd += ["-i", ref_video, "-c:v", actual_codec, "-b:v", f"{br}k"]
+        cmd += SPEED_FLAGS.get(ffmpeg_codec, [])
+        cmd += ["-an", tmp]
 
     t0 = time.time()
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     elapsed = time.time() - t0
 
     if proc.returncode != 0 or not os.path.exists(tmp):
-        print(f"\n  ✗ {codec_name} @ {br}kbps failed", flush=True)
-        return None
+        # GPU encoder failed (e.g. hevc_amf at low res) — fall back to software
+        if use_gpu and actual_codec != ffmpeg_codec:
+            cmd_sw = ["ffmpeg", "-hide_banner", "-y",
+                      "-i", ref_video, "-c:v", ffmpeg_codec, "-b:v", f"{br}k"]
+            cmd_sw += SPEED_FLAGS.get(ffmpeg_codec, [])
+            cmd_sw += ["-an", tmp]
+            t0 = time.time()
+            proc = subprocess.run(cmd_sw, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elapsed = time.time() - t0
+            if proc.returncode != 0 or not os.path.exists(tmp):
+                print(f"\n  ✗ {codec_name} @ {br}kbps failed", flush=True)
+                return None
+            print(f"\n  ⚠ {codec_name} @ {br}kbps → SW fallback ({res})", flush=True)
+        else:
+            print(f"\n  ✗ {codec_name} @ {br}kbps failed", flush=True)
+            return None
 
     comp_size = os.path.getsize(tmp)
     psnr      = get_psnr(ref_video, tmp)
@@ -124,9 +182,15 @@ def main():
         print(f"Error: {INPUT_VIDEO} not found.")
         return
 
-    use_gpu = detect_nvenc()
-    print(f"GPU:     {'✓ NVENC (h264_nvenc / hevc_nvenc)' if use_gpu else '✗ CPU — ultrafast preset active'}")
-    print(f"Clip:    {CLIP_DURATION}s  |  Workers: {MAX_WORKERS}  |  Resolutions: {RESOLUTIONS}\n")
+    # Dynamic GPU Type Check
+    gpu_type = detect_gpu_hardware()
+    use_gpu = gpu_type is not None
+    
+    # Set the mapping dynamically
+    current_gpu_map = AMF_MAP if gpu_type == "amf" else NVENC_MAP
+
+    print(f"GPU Status: {'✓ ' + gpu_type.upper() + ' detected' if use_gpu else '✗ CPU fallback'}")
+    print(f"Clip:       {CLIP_DURATION}s  |  Workers: {MAX_WORKERS}\n")
 
     all_data = {
         res: {c: {"psnr": [], "ratio": [], "time": [], "bitrate": []} for c in CODECS}
@@ -141,12 +205,16 @@ def main():
         ref_size = os.path.getsize(ref)
 
         # Build all (codec × bitrate) tasks for this resolution
+        # Inside main():
         tasks = []
         for codec_name, ffmpeg_codec in CODECS.items():
             if codec_name == "H.261" and res not in ("176x144", "352x288"):
                 continue
             for br in BITRATES_KBPS:
-                tasks.append((ref, ref_size, codec_name, ffmpeg_codec, br, res, use_gpu))
+                if codec_name == "MPEG-1" and br > 2500:
+                    continue
+                    
+                tasks.append((ref, ref_size, codec_name, ffmpeg_codec, br, res, use_gpu, current_gpu_map))
 
         done = 0
         print(f"  {len(tasks)} jobs queued...", flush=True)
