@@ -8,9 +8,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
-INPUT_VIDEO   = "bbb10_lossless.mov"
+INPUT_VIDEO   = "foreman_lossless.mov"
 RESOLUTIONS   = ["176x144", "352x288", "720x480", "1280x720", "1920x1080"]
-BITRATES_KBPS = [100, 500, 1000, 2500, 5000, 7500, 10000, 15000]
+# BITRATES_KBPS = range(100, 15000, 100)
+BITRATES_KBPS = [50, 100, 200, 300, 500, 750, 1000, 1500, 2000, 2500,
+                 3000, 4000, 5000, 6000, 7500, 9000, 10000, 12000, 15000]
+# BITRATES_KBPS = [100, 500, 1000, 2500, 5000, 7500, 10000, 15000]
 
 # ★ SPEEDUP #1 — only encode this many seconds of video instead of the full clip.
 #   For a ~10-minute video this alone gives a ~60× wall-clock reduction.
@@ -18,7 +21,7 @@ CLIP_DURATION = 10    # seconds
 
 # ★ SPEEDUP #2 — run this many encode jobs at the same time.
 #   Colab standard tier has 2 vCPUs; 4 workers keeps both busy while one waits on I/O.
-MAX_WORKERS   = 8
+MAX_WORKERS   = 6
 
 CODECS = {
     "H.261":  "h261",
@@ -29,9 +32,14 @@ CODECS = {
 }
 
 # ★ SPEEDUP #3 — ultrafast presets for software encoders (5-10× vs default).
+# SPEED_FLAGS = {
+#     "libx264": ["-preset", "ultrafast"],
+#     "libx265": ["-preset", "ultrafast", "-x265-params", "log-level=error"],
+# }
+
 SPEED_FLAGS = {
-    "libx264": ["-preset", "ultrafast"],
-    "libx265": ["-preset", "ultrafast", "-x265-params", "log-level=error"],
+    "libx264": ["-preset", "medium"],
+    "libx265": ["-preset", "medium", "-x265-params", "log-level=error"],
 }
 
 # CUDA
@@ -89,6 +97,7 @@ def detect_gpu_hardware() -> str:
     Detects if NVENC (NVIDIA) or AMF (AMD) encoders are physically available and working.
     Returns: 'nvenc', 'amf', or None
     """
+    return None
     try:
         # First check if the encoders are compiled in
         enc = subprocess.run(
