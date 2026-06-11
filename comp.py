@@ -21,7 +21,7 @@ CLIP_DURATION = 10    # seconds
 
 # ★ SPEEDUP #2 — run this many encode jobs at the same time.
 #   Colab standard tier has 2 vCPUs; 4 workers keeps both busy while one waits on I/O.
-MAX_WORKERS   = 6
+MAX_WORKERS   = 2
 
 CODECS = {
     "H.261":  "h261",
@@ -135,7 +135,7 @@ def encode_task(args: tuple):
     ref_video, ref_size, codec_name, ffmpeg_codec, br, res, use_gpu, current_gpu_map = args
 
     # Unique temp filename per thread to avoid collisions
-    tmp = f"tmp_{res}_{codec_name}_{br}k_{threading.get_ident()}.mkv"
+    tmp = f"{codec_name}_{res}_{br}kbps.mkv"
     actual_codec = current_gpu_map.get(ffmpeg_codec, ffmpeg_codec) if use_gpu else ffmpeg_codec
 
     # Base command structure
@@ -180,7 +180,7 @@ def encode_task(args: tuple):
     comp_size = os.path.getsize(tmp)
     psnr      = get_psnr(ref_video, tmp)
     ratio     = ref_size / comp_size if comp_size > 0 else 0.0
-    os.remove(tmp)
+
     return br, psnr, ratio, elapsed
 
 
